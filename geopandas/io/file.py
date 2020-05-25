@@ -1,23 +1,29 @@
 from distutils.version import LooseVersion
 
+import io
 import numpy as np
+import pandas as pd
 
 import fiona
-
-from geopandas import GeoDataFrame, GeoSeries
+import pyproj
+from shapely.geometry import mapping
+from shapely.geometry.base import BaseGeometry
 
 try:
     from fiona import Env as fiona_env
 except ImportError:
     from fiona import drivers as fiona_env
+
+from geopandas import GeoDataFrame, GeoSeries
+
+
 # Adapted from pandas.io.common
 from urllib.request import urlopen as _urlopen
 from urllib.parse import urlparse as parse_url
-from urllib.parse import uses_relative, uses_netloc, uses_params
+from urllib.parse import uses_netloc, uses_params, uses_relative
+
 
 _FIONA18 = LooseVersion(fiona.__version__) >= LooseVersion("1.8")
-
-
 _VALID_URLS = set(uses_relative + uses_netloc + uses_params)
 _VALID_URLS.discard("")
 
@@ -30,19 +36,31 @@ def _is_url(url):
         return False
 
 
-def read_file(filename, bbox=None, **kwargs):
+def _read_file(filename, bbox=None, mask=None, rows=None, **kwargs):
     """
     Returns a GeoDataFrame from a file or URL.
 
+    .. versionadded:: 0.7.0 mask, rows
+
     Parameters
     ----------
-    filename: str
+    filename : str, path object or file-like object
         Either the absolute or relative path to the file or URL to
-        be opened.
-    bbox : tuple | GeoDataFrame or GeoSeries, default None
-        Filter features by given bounding box, GeoSeries, or GeoDataFrame.
+        be opened, or any object with a read() method (such as an open file
+        or StringIO)
+    bbox : tuple | GeoDataFrame or GeoSeries | shapely Geometry, default None
+        Filter features by given bounding box, GeoSeries, GeoDataFrame or a
+        shapely geometry. CRS mis-matches are resolved if given a GeoSeries
+        or GeoDataFrame. Cannot be used with mask.
+    mask : dict | GeoDataFrame or GeoSeries | shapely Geometry, default None
+        Filter for features that intersect with the given dict-like geojson
+        geometry, GeoSeries, GeoDataFrame or shapely geometry.
         CRS mis-matches are resolved if given a GeoSeries or GeoDataFrame.
-    **kwargs:
+        Cannot be used with bbox.
+    rows : int or slice, default None
+        Load in specific rows by passing an integer (first `n` rows) or a
+        slice() object.
+    **kwargs :
         Keyword args to be passed to the `open` or `BytesCollection` method
         in the fiona library when opening the file. For more information on
         possible keywords, type:
@@ -54,12 +72,22 @@ def read_file(filename, bbox=None, **kwargs):
 
     Returns
     -------
-    geodataframe : GeoDataFrame
+    :obj:`geopandas.GeoDataFrame` or :obj:`pandas.DataFrame` :
+        If `ignore_geometry=True` a :obj:`pandas.DataFrame` will be returned.
+
+    Notes
+    -----
+    The format drivers will attempt to detect the encoding of your data, but
+    may fail. In this case, the proper encoding can be specified explicitly
+    by using the encoding keyword parameter, e.g. ``encoding='utf-8'``.
     """
     if _is_url(filename):
         req = _urlopen(filename)
         path_or_bytes = req.read()
         reader = fiona.BytesCollection
+    elif isinstance(filename, io.TextIOBase):
+        path_or_bytes = filename.read()
+        reader = fiona.open
     else:
         path_or_bytes = filename
         reader = fiona.open
@@ -68,28 +96,88 @@ def read_file(filename, bbox=None, **kwargs):
         with reader(path_or_bytes, **kwargs) as features:
 
             # In a future Fiona release the crs attribute of features will
-            # no longer be a dict. The following code will be both forward
-            # and backward compatible.
-            if hasattr(features.crs, "to_dict"):
-                crs = features.crs.to_dict()
-            else:
-                crs = features.crs
+            # no longer be a dict, but will behave like a dict. So this should
+            # be forwards compatible
+            crs = (
+                features.crs["init"]
+                if features.crs and "init" in features.crs
+                else features.crs_wkt
+            )
 
+            # handle loading the bounding box
             if bbox is not None:
-                if isinstance(bbox, GeoDataFrame) or isinstance(bbox, GeoSeries):
+                if isinstance(bbox, (GeoDataFrame, GeoSeries)):
                     bbox = tuple(bbox.to_crs(crs).total_bounds)
+                elif isinstance(bbox, BaseGeometry):
+                    bbox = bbox.bounds
                 assert len(bbox) == 4
-                f_filt = features.filter(bbox=bbox)
+            # handle loading the mask
+            elif isinstance(mask, (GeoDataFrame, GeoSeries)):
+                mask = mapping(mask.to_crs(crs).unary_union)
+            elif isinstance(mask, BaseGeometry):
+                mask = mapping(mask)
+            # setup the data loading filter
+            if rows is not None:
+                if isinstance(rows, int):
+                    rows = slice(rows)
+                elif not isinstance(rows, slice):
+                    raise TypeError("'rows' must be an integer or a slice.")
+                f_filt = features.filter(
+                    rows.start, rows.stop, rows.step, bbox=bbox, mask=mask
+                )
+            elif any((bbox, mask)):
+                f_filt = features.filter(bbox=bbox, mask=mask)
             else:
                 f_filt = features
+            # get list of columns
+            columns = list(features.schema["properties"])
+            if kwargs.get("ignore_geometry", False):
+                return pd.DataFrame(
+                    [record["properties"] for record in f_filt], columns=columns
+                )
 
-            columns = list(features.meta["schema"]["properties"]) + ["geometry"]
-            gdf = GeoDataFrame.from_features(f_filt, crs=crs, columns=columns)
+            return GeoDataFrame.from_features(
+                f_filt, crs=crs, columns=columns + ["geometry"]
+            )
 
-    return gdf
+
+def read_file(*args, **kwargs):
+    import warnings
+
+    warnings.warn(
+        "geopandas.io.file.read_file() is intended for internal "
+        "use only, and will be deprecated. Use geopandas.read_file() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    return _read_file(*args, **kwargs)
 
 
-def to_file(df, filename, driver="ESRI Shapefile", schema=None, **kwargs):
+def to_file(*args, **kwargs):
+    import warnings
+
+    warnings.warn(
+        "geopandas.io.file.to_file() is intended for internal "
+        "use only, and will be deprecated. Use GeoDataFrame.to_file() "
+        "or GeoSeries.to_file() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    return _to_file(*args, **kwargs)
+
+
+def _to_file(
+    df,
+    filename,
+    driver="ESRI Shapefile",
+    schema=None,
+    index=None,
+    mode="w",
+    crs=None,
+    **kwargs
+):
     """
     Write this GeoDataFrame to an OGR data source
 
@@ -108,16 +196,63 @@ def to_file(df, filename, driver="ESRI Shapefile", schema=None, **kwargs):
         If specified, the schema dictionary is passed to Fiona to
         better control how the file is written. If None, GeoPandas
         will determine the schema based on each column's dtype
+    index : bool, default None
+        If True, write index into one or more columns (for MultiIndex).
+        Default None writes the index into one or more columns only if
+        the index is named, is a MultiIndex, or has a non-integer data
+        type. If False, no index is written.
+
+        .. versionadded:: 0.7
+            Previously the index was not written.
+    mode : string, default 'w'
+        The write mode, 'w' to overwrite the existing file and 'a' to append.
+        Not all drivers support appending. The drivers that support appending
+        are listed in fiona.supported_drivers or
+        https://github.com/Toblerity/Fiona/blob/master/fiona/drvsupport.py
+    crs : pyproj.CRS, default None
+        If specified, the CRS is passed to Fiona to
+        better control how the file is written. If None, GeoPandas
+        will determine the crs based on crs df attribute.
+        The value can be anything accepted
+        by :meth:`pyproj.CRS.from_user_input() <pyproj.crs.CRS.from_user_input>`,
+        such as an authority string (eg "EPSG:4326") or a WKT string.
 
     The *kwargs* are passed to fiona.open and can be used to write
     to multi-layer data, store data within archives (zip files), etc.
     The path may specify a fiona VSI scheme.
+
+    Notes
+    -----
+    The format drivers will attempt to detect the encoding of your data, but
+    may fail. In this case, the proper encoding can be specified explicitly
+    by using the encoding keyword parameter, e.g. ``encoding='utf-8'``.
     """
+    if index is None:
+        # Determine if index attribute(s) should be saved to file
+        index = list(df.index.names) != [None] or type(df.index) not in (
+            pd.RangeIndex,
+            pd.Int64Index,
+        )
+    if index:
+        df = df.reset_index(drop=False)
     if schema is None:
         schema = infer_schema(df)
+    if crs:
+        crs = pyproj.CRS.from_user_input(crs)
+    else:
+        crs = df.crs
     with fiona_env():
+        crs_wkt = None
+        try:
+            gdal_version = fiona.env.get_gdal_release_name()
+        except AttributeError:
+            gdal_version = "2.0.0"  # just assume it is not the latest
+        if LooseVersion(gdal_version) >= LooseVersion("3.0.0") and crs:
+            crs_wkt = crs.to_wkt()
+        elif crs:
+            crs_wkt = crs.to_wkt("WKT1_GDAL")
         with fiona.open(
-            filename, "w", driver=driver, crs=df.crs, schema=schema, **kwargs
+            filename, mode=mode, driver=driver, crs_wkt=crs_wkt, schema=schema, **kwargs
         ) as colxn:
             colxn.writerecords(df.iterfeatures())
 
